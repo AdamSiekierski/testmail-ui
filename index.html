@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Testmail Inboxes</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --text: #1d2330; --muted: #6b7385; --line: #e3e6ec;
+    --accent: #2f6fed; --sel: #e8f0ff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171c; --panel: #1b1f26; --text: #e6e9ef; --muted: #8d95a5; --line: #2b313b;
+      --accent: #6c9bff; --sel: #243149; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--text);
+    height: 100vh; display: grid; grid-template-columns: 240px 360px 1fr; }
+  aside, section, main { overflow: auto; border-right: 1px solid var(--line); background: var(--panel); }
+  main { background: var(--bg); display: flex; flex-direction: column; }
+  header { padding: 10px 12px; border-bottom: 1px solid var(--line); display: flex; gap: 6px;
+    align-items: center; position: sticky; top: 0; background: var(--panel); z-index: 1; }
+  input { width: 100%; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--bg); color: var(--text); font: inherit; }
+  button { padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg);
+    color: var(--text); font: inherit; cursor: pointer; white-space: nowrap; }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { padding: 8px 12px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  li:hover { background: var(--bg); }
+  li.sel { background: var(--sel); }
+  .row { display: flex; justify-content: space-between; gap: 8px; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tag { font-weight: 600; }
+  .count { color: var(--muted); font-size: 12px; }
+  .meta { padding: 12px 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  .meta h2 { margin: 0 0 6px; font-size: 16px; }
+  .meta dl { margin: 0; display: grid; grid-template-columns: 60px 1fr; gap: 2px 8px; font-size: 13px; }
+  .meta dt { color: var(--muted); }
+  .meta dd { margin: 0; word-break: break-all; }
+  .tabs { display: flex; gap: 6px; margin-top: 8px; }
+  .tabs button.on { border-color: var(--accent); color: var(--accent); }
+  iframe { flex: 1; border: 0; background: #fff; width: 100%; }
+  pre { flex: 1; margin: 0; padding: 16px; white-space: pre-wrap; word-break: break-word; }
+  .empty { padding: 24px; color: var(--muted); }
+  .more { padding: 10px 12px; }
+  .err { color: #d33; padding: 12px; }
+  @media (max-width: 900px) { body { grid-template-columns: 1fr; height: auto; }
+    aside, section { max-height: 40vh; } main { min-height: 70vh; } }
+</style>
+</head>
+<body>
+<aside>
+  <header><input id="ns" placeholder="namespace" title="Testmail namespace"></header>
+  <header><input id="filter" placeholder="Filter inboxes…"></header>
+  <ul id="tags"></ul>
+</aside>
+<section>
+  <header>
+    <strong id="listTitle" class="ellipsis" style="flex:1">All inboxes</strong>
+    <button id="refresh" title="Reload">↻</button>
+    <label class="muted" title="Reload every 10 s"><input id="auto" type="checkbox" style="width:auto"> auto</label>
+  </header>
+  <ul id="emails"></ul>
+  <div class="more"><button id="more" hidden>Load more</button> <span id="status" class="muted"></span></div>
+</section>
+<main id="view"><div class="empty">Select an email.</div></main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const PAGE = 100;
+let ns = '', tag = null, emails = [], total = 0, selectedId = null, mode = 'html';
+const tagStats = new Map(); // tag -> { count, last }
+
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const when = (ts) => {
+  const d = new Date(ts), now = new Date();
+  return d.toDateString() === now.toDateString()
+    ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    : d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+};
+const address = (t) => `${ns}.${t}@inbox.testmail.app`;
+
+async function fetchPage(offset, onlyTag) {
+  const q = new URLSearchParams({ namespace: ns, limit: PAGE, offset });
+  if (onlyTag) q.set('tag', onlyTag);
+  const res = await fetch(`/api/emails?${q}`);
+  const body = await res.json();
+  if (body.result !== 'success') throw new Error(body.message || `Testmail said ${res.status}`);
+  return body;
+}
+
+// The sidebar is built from the most recent mails of the whole namespace (Testmail has no "list tags" call).
+async function loadTags() {
+  tagStats.clear();
+  let offset = 0;
+  for (let i = 0; i < 5; i++) {
+    const page = await fetchPage(offset);
+    for (const e of page.emails) {
+      const s = tagStats.get(e.tag) ?? { count: 0, last: 0 };
+      s.count++; s.last = Math.max(s.last, e.timestamp);
+      tagStats.set(e.tag, s);
+    }
+    offset += page.emails.length;
+    if (offset >= page.count || page.emails.length < PAGE) break;
+  }
+  renderTags();
+}
+
+function renderTags() {
+  const f = $('filter').value.toLowerCase();
+  const rows = [...tagStats].filter(([t]) => t.toLowerCase().includes(f)).sort((a, b) => b[1].last - a[1].last);
+  $('tags').innerHTML =
+    `<li data-tag="" class="${tag === null ? 'sel' : ''}"><span class="tag">All inboxes</span></li>` +
+    rows.map(([t, s]) => `<li data-tag="${esc(t)}" class="${t === tag ? 'sel' : ''}" title="${esc(address(t))}">
+      <div class="row"><span class="tag ellipsis">${esc(t)}</span><span class="count">${s.count}</span></div>
+      <div class="muted">${when(s.last)}</div></li>`).join('');
+}
+
+async function loadEmails(append = false) {
+  $('status').textContent = 'Loading…';
+  try {
+    const page = await fetchPage(append ? emails.length : 0, tag);
+    emails = append ? emails.concat(page.emails) : page.emails;
+    total = page.count;
+    $('status').textContent = `${emails.length} of ${total}`;
+    $('more').hidden = emails.length >= total;
+    renderEmails();
+  } catch (err) {
+    $('status').textContent = '';
+    $('emails').innerHTML = `<div class="err">${esc(err.message)}</div>`;
+  }
+}
+
+function renderEmails() {
+  $('listTitle').textContent = tag === null ? 'All inboxes' : address(tag);
+  $('emails').innerHTML = emails.length ? emails.map((e) => `
+    <li data-id="${esc(e.id)}" class="${e.id === selectedId ? 'sel' : ''}">
+      <div class="row"><span class="ellipsis">${esc(e.from_parsed?.[0]?.name || e.from)}</span><span class="muted">${when(e.timestamp)}</span></div>
+      <div class="ellipsis"><strong>${esc(e.subject || '(no subject)')}</strong></div>
+      ${tag === null ? `<div class="muted ellipsis">${esc(e.tag)}</div>` : ''}
+    </li>`).join('') : '<div class="empty">No emails.</div>';
+}
+
+function renderView() {
+  const e = emails.find((x) => x.id === selectedId);
+  if (!e) { $('view').innerHTML = '<div class="empty">Select an email.</div>'; return; }
+  if (!e.html && mode === 'html') mode = 'text';
+  const attachments = (e.attachments ?? []).map((a) => esc(a.filename)).join(', ');
+  $('view').innerHTML = `
+    <div class="meta">
+      <h2>${esc(e.subject || '(no subject)')}</h2>
+      <dl>
+        <dt>From</dt><dd>${esc(e.from)}</dd>
+        <dt>To</dt><dd>${esc(e.to)}</dd>
+        <dt>Date</dt><dd>${esc(new Date(e.timestamp).toLocaleString())}</dd>
+        ${attachments ? `<dt>Files</dt><dd>${attachments}</dd>` : ''}
+      </dl>
+      <div class="tabs">
+        <button data-mode="html" class="${mode === 'html' ? 'on' : ''}" ${e.html ? '' : 'disabled'}>HTML</button>
+        <button data-mode="text" class="${mode === 'text' ? 'on' : ''}">Text</button>
+        <button data-mode="raw" class="${mode === 'raw' ? 'on' : ''}">JSON</button>
+      </div>
+    </div>`;
+  if (mode === 'html') {
+    const frame = document.createElement('iframe');
+    frame.sandbox = 'allow-popups allow-popups-to-escape-sandbox'; // no scripts
+    frame.srcdoc = `<base target="_blank">${e.html}`;
+    $('view').append(frame);
+  } else {
+    const pre = document.createElement('pre');
+    pre.textContent = mode === 'text' ? (e.text ?? '') : JSON.stringify(e, null, 2);
+    $('view').append(pre);
+  }
+}
+
+async function reload() {
+  try { await loadTags(); } catch (err) { $('tags').innerHTML = `<div class="err">${esc(err.message)}</div>`; }
+  await loadEmails();
+  renderView();
+}
+
+$('tags').onclick = (ev) => {
+  const li = ev.target.closest('li'); if (!li) return;
+  tag = li.dataset.tag || null; selectedId = null;
+  renderTags(); renderView(); loadEmails();
+};
+$('emails').onclick = (ev) => {
+  const li = ev.target.closest('li'); if (!li) return;
+  selectedId = li.dataset.id; mode = 'html'; renderEmails(); renderView();
+};
+$('view').onclick = (ev) => {
+  const b = ev.target.closest('button[data-mode]'); if (!b) return;
+  mode = b.dataset.mode; renderView();
+};
+$('filter').oninput = renderTags;
+$('refresh').onclick = reload;
+$('more').onclick = () => loadEmails(true);
+$('ns').onchange = () => { ns = $('ns').value.trim(); tag = null; selectedId = null; reload(); };
+let timer = null;
+$('auto').onchange = () => { clearInterval(timer); if ($('auto').checked) timer = setInterval(() => loadEmails(), 10_000); };
+
+fetch('/api/config').then((r) => r.json()).then((c) => { ns = c.namespace; $('ns').value = ns; reload(); });
+</script>
+</body>
+</html>
